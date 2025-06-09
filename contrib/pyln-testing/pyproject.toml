@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pyln-testing"
-version = "25.02"
+version = "25.05rc1"
 description = "Test your Core Lightning integration, plugins or whatever you want"
 authors = ["Christian Decker <decker.christian@gmail.com>"]
 license = "BSD-MIT"
@@ -26,7 +26,7 @@ requests = "^2.31.0"
 grpcio = { version = "^1", optional = true }
 pyln-grpc-proto = { version = "^0.1", optional = true }
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies]
 pyln-client = { path = "../pyln-client", develop = true}
 pyln-grpc-proto = { path = "../pyln-grpc-proto", develop = true, optional = true}
 

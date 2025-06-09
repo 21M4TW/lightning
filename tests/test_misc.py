@@ -1,3 +1,4 @@
+import base64
 from bitcoin.rpc import RawProxy
 from decimal import Decimal
 from fixtures import *  # noqa: F401,F403
@@ -172,12 +173,15 @@ def test_bitcoin_pruned(node_factory, bitcoind):
             "result": [
                 {
                     "id": 1,
+                    "services": "000000000000040d",
                 },
                 {
                     "id": 2,
+                    "services": "0000000000000001",
                 },
                 {
                     "id": 3,
+                    "services": "0000000000000000",
                 },
             ],
         }
@@ -210,10 +214,10 @@ def test_bitcoin_pruned(node_factory, bitcoind):
     l1.daemon.rpcproxy.mock_rpc("getblockfrompeer", mock_getblockfrompeer())
     l1.start(wait_for_bitcoind_sync=False)
 
-    # check that we fetched a block from a peer (1st peer (from the back) in this case).
+    # check that we fetched a block from a peer (1st peer (from the back) in this case, but not from 3 which isn't a full node).
     pruned_block = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
     l1.daemon.wait_for_log(f"failed to fetch block {pruned_block} from the bitcoin backend")
-    l1.daemon.wait_for_log(rf"try to fetch block {pruned_block} from peer 3")
+    l1.daemon.wait_for_log(rf"try to fetch block {pruned_block} from peer 2")
     l1.daemon.wait_for_log(rf"Adding block (\d+): {pruned_block}")
 
     # check that we can also fetch from a peer > 1st (from the back).
@@ -222,8 +226,8 @@ def test_bitcoin_pruned(node_factory, bitcoind):
 
     pruned_block = bitcoind.rpc.getblockhash(bitcoind.rpc.getblockcount())
     l1.daemon.wait_for_log(f"failed to fetch block {pruned_block} from the bitcoin backend")
-    l1.daemon.wait_for_log(rf"failed to fetch block {pruned_block} from peer 3")
-    l1.daemon.wait_for_log(rf"try to fetch block {pruned_block} from peer (\d+)")
+    l1.daemon.wait_for_log(rf"failed to fetch block {pruned_block} from peer 2")
+    l1.daemon.wait_for_log(rf"try to fetch block {pruned_block} from peer 1")
     l1.daemon.wait_for_log(rf"Adding block (\d+): {pruned_block}")
 
     # check that we retry if we could not fetch any block
@@ -359,7 +363,7 @@ def test_ping(node_factory):
     ping_tests(l1, l2)
 
 
-def test_htlc_sig_persistence(node_factory, bitcoind, executor):
+def test_htlc_sig_persistence(node_factory, bitcoind, executor, chainparams):
     """Interrupt a payment between two peers, then fail and recover funds using the HTLC sig.
     """
     # Feerates identical so we don't get gratuitous commit to update them
@@ -399,8 +403,9 @@ def test_htlc_sig_persistence(node_factory, bitcoind, executor):
 
     bitcoind.generate_block(5)
     bitcoind.generate_block(1, wait_for_mempool=txid)
+    outtype = 'p2tr' if not chainparams['elements'] else 'p2wpkh'
     l1.daemon.wait_for_logs([
-        r'Owning output . (\d+)sat .SEGWIT. txid',
+        rf'Owning output . (\d+)sat \({outtype}\) txid {txid} CONFIRMED',
     ])
 
     # We should now have 1) the unilateral to us, and b) the HTLC respend to us
@@ -745,7 +750,7 @@ def test_withdraw_misc(node_factory, bitcoind, chainparams):
         {'type': 'chain_mvt', 'credit_msat': 2000000000, 'debit_msat': 0, 'tags': ['deposit']},
         {'type': 'chain_mvt', 'credit_msat': 2000000000, 'debit_msat': 0, 'tags': ['deposit']},
         {'type': 'chain_mvt', 'credit_msat': 2000000000, 'debit_msat': 0, 'tags': ['deposit']},
-        {'type': 'chain_mvt', 'credit_msat': 11956163000, 'debit_msat': 0, 'tags': ['deposit']},
+        {'type': 'chain_mvt', 'credit_msat': 11957393000, 'debit_msat': 0, 'tags': ['deposit']},
     ]
 
     check_coin_moves(l1, 'external', external_moves, chainparams)
@@ -2152,7 +2157,7 @@ def test_bitcoind_fail_first(node_factory, bitcoind):
     # first.
     timeout = 5 if 5 < TIMEOUT // 3 else TIMEOUT // 3
     l1 = node_factory.get_node(start=False,
-                               broken_log=r'plugin-bcli: .*-stdinrpcpass getblockhash 100 exited 1 \(after [0-9]* other errors\)',
+                               broken_log=r'plugin-bcli: .*(-stdinrpcpass getblockhash 100 exited 1 \(after [0-9]* other errors\)|we have been retrying command for)',
                                may_fail=True,
                                options={'bitcoin-retry-timeout': timeout})
 
@@ -2399,6 +2404,7 @@ def test_list_features_only(node_factory):
                 'option_shutdown_anysegwit/odd',
                 'option_quiesce/odd',
                 'option_onion_messages/odd',
+                'option_provide_storage/odd',
                 'option_channel_type/odd',
                 'option_scid_alias/odd',
                 'option_zeroconf/odd']
@@ -2478,6 +2484,42 @@ def test_signmessage(node_factory):
     # check that checkmassage used with a wrong zbase format throws an RPC exception
     with pytest.raises(RpcError, match="zbase is not valid zbase32"):
         l2.rpc.checkmessage(message="wrong zbase format", zbase="wrong zbase format")
+
+
+def test_signmessagewithkey(node_factory, chainparams):
+    l1, l2 = node_factory.get_nodes(2)
+    message = "a test message"
+    addr_bech32 = l1.rpc.newaddr("bech32")["bech32"]
+    addr_other = l2.rpc.newaddr("bech32")["bech32"]
+    if TEST_NETWORK != "liquid-regtest":
+        # refuse to sign if the address is not a P2WPKH
+        addr_p2tr = l1.rpc.newaddr("p2tr")["p2tr"]
+        with pytest.raises(
+            RpcError, match=r"Address is not p2wpkh and it is not supported"
+        ):
+            l1.rpc.signmessagewithkey(message, addr_p2tr)
+
+    # refuse to sign if the address does not belong to us
+    with pytest.raises(
+        RpcError, match=r"Address is not found in the wallet\'s database"
+    ):
+        l1.rpc.signmessagewithkey(message, addr_other)
+    response = l1.rpc.signmessagewithkey(message, addr_bech32)
+    assert response["address"] == addr_bech32
+    signature = base64.b64decode(response["base64"])
+    assert signature.hex() == response["signature"]
+    assert (
+        subprocess.check_output(
+            [
+                "devtools/bip137-verifysignature",
+                message,
+                response["signature"],
+                response["address"],
+                chainparams["name"],
+            ]
+        ).decode("utf-8")
+        == "Signature is valid!\n"
+    )
 
 
 def test_include(node_factory):
@@ -2975,6 +3017,7 @@ def test_emergencyrecoverpenaltytxn(node_factory, bitcoind):
     stubs = l1.rpc.emergencyrecover()["stubs"]
     assert len(stubs) == 1
     assert stubs[0] == _["channel_id"]
+    l1.daemon.wait_for_log('Sending a bogus channel_reestablish message to make the peer unilaterally close the channel.')
     l1.daemon.wait_for_log('peer_out WIRE_ERROR')
 
     # Restarting so that L1
@@ -3022,7 +3065,10 @@ def test_emergencyrecover(node_factory, bitcoind):
     listfunds = l1.rpc.listfunds()["channels"][0]
     assert listfunds["short_channel_id"] == "1x1x1"
 
+    l1.daemon.wait_for_log('Sending a bogus channel_reestablish message to make the peer unilaterally close the channel.')
     l1.daemon.wait_for_log('peer_out WIRE_ERROR')
+
+    l2.daemon.wait_for_log('bad reestablish commitment_number: 0')
     l2.daemon.wait_for_log('State changed from CHANNELD_NORMAL to AWAITING_UNILATERAL')
 
     bitcoind.generate_block(5, wait_for_mempool=1)
@@ -3043,27 +3089,11 @@ def test_emergencyrecover(node_factory, bitcoind):
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
 def test_recover_plugin(node_factory, bitcoind):
-    l1 = node_factory.get_node(
-        may_reconnect=True,
-        allow_warning=True,
-        feerates=(7500, 7500, 7500, 7500),
-        options={
-            'log-level': 'info',
-            'experimental-peer-storage': None,
-            'dev-no-reconnect': None,
-        },
-    )
-    l2 = node_factory.get_node(
-        may_reconnect=True,
-        feerates=(7500, 7500, 7500, 7500),
-        broken_log='.*',
-        allow_bad_gossip=True,
-        options={
-            'log-level': 'info',
-            'experimental-peer-storage': None,
-            'dev-no-reconnect': None,
-        },
-    )
+    l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True,
+                                              'dev-no-reconnect': None},
+                                             {'may_reconnect': True,
+                                              'dev-no-reconnect': None,
+                                              'broken_log': 'Cannot broadcast our commitment tx: they have a future one|ERROR: Unknown commitment #[0-9]*, recovering our funds!'}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l2.fundchannel(l1, 10**6)
@@ -3114,17 +3144,24 @@ def test_restorefrompeer(node_factory, bitcoind):
     Test restorefrompeer
     """
     l1, l2 = node_factory.get_nodes(2, [{'broken_log': 'ERROR: Unknown commitment #.*, recovering our funds!',
-                                         'experimental-peer-storage': None,
                                          'may_reconnect': True,
                                          'allow_bad_gossip': True},
-                                        {'experimental-peer-storage': None,
-                                         'may_reconnect': True}])
+                                        {'may_reconnect': True}])
 
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
     c12, _ = l1.fundchannel(l2, 10**5)
     assert l1.daemon.is_in_log('Peer storage sent!')
     assert l2.daemon.is_in_log('Peer storage sent!')
+
+    # Note: each node may or may not send peer_storage_retrieval: if it
+    # receives storage fast enough, it will, otherwise not.
+    l1.rpc.disconnect(l2.info['id'], force=True)
+    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
+    l1.daemon.wait_for_logs(['peer_out WIRE_PEER_STORAGE',
+                             'peer_in WIRE_PEER_STORAGE'])
+    l2.daemon.wait_for_logs(['peer_out WIRE_PEER_STORAGE',
+                             'peer_in WIRE_PEER_STORAGE'])
 
     l1.stop()
     os.unlink(os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "lightningd.sqlite3"))
@@ -3143,7 +3180,9 @@ def test_restorefrompeer(node_factory, bitcoind):
 
     assert l1.rpc.restorefrompeer()['stubs'][0] == _['channel_id']
 
+    l1.daemon.wait_for_log('Sending a bogus channel_reestablish message to make the peer unilaterally close the channel.')
     l1.daemon.wait_for_log('peer_out WIRE_ERROR')
+
     l2.daemon.wait_for_log('State changed from CHANNELD_NORMAL to AWAITING_UNILATERAL')
 
     bitcoind.generate_block(5, wait_for_mempool=1)
@@ -3229,9 +3268,41 @@ def test_listforwards_and_listhtlcs(node_factory, bitcoind):
     l1.wait_channel_active(c23)
     l1.wait_channel_active(c24)
 
+    # All variants of listhlcs will give empty results
+    assert l2.rpc.listhtlcs() == {'htlcs': []}
+    assert l2.rpc.listhtlcs(c12) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(index='created') == {'htlcs': []}
+    assert l2.rpc.listhtlcs(id=c12, index='created') == {'htlcs': []}
+    assert l2.rpc.listhtlcs(index='created', start=2) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(id=c12, index='created', start=2) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(index='updated') == {'htlcs': []}
+    assert l2.rpc.listhtlcs(id=c12, index='updated') == {'htlcs': []}
+    assert l2.rpc.listhtlcs(index='updated', start=1) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=1) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(index='updated', start=2) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=2) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(index='updated', start=1, limit=1) == {'htlcs': []}
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=1, limit=1) == {'htlcs': []}
+
     # successful payments
     i31 = l3.rpc.invoice(1000, 'i31', 'desc')
     l1.rpc.pay(i31['bolt11'])
+
+    # 1 htlc in, 1 htlc out.
+    assert len(l2.rpc.listhtlcs()['htlcs']) == 2
+    assert len(l2.rpc.listhtlcs(c12)['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(index='created')['htlcs']) == 2
+    assert len(l2.rpc.listhtlcs(id=c12, index='created')['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(index='created', start=2)['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(id=c12, index='created', start=2)['htlcs']) == 0
+    assert len(l2.rpc.listhtlcs(index='updated')['htlcs']) == 2
+    assert len(l2.rpc.listhtlcs(id=c12, index='updated')['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(index='updated', start=1)['htlcs']) == 2
+    assert len(l2.rpc.listhtlcs(id=c12, index='updated', start=1)['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(index='updated', start=2)['htlcs']) == 2
+    assert len(l2.rpc.listhtlcs(id=c12, index='updated', start=2)['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(index='updated', start=1, limit=1)['htlcs']) == 1
+    assert len(l2.rpc.listhtlcs(id=c12, index='updated', start=1, limit=1)['htlcs']) == 1
 
     i41 = l4.rpc.invoice(2000, 'i41', 'desc')
     l1.rpc.pay(i41['bolt11'])
@@ -3294,13 +3365,18 @@ def test_listforwards_and_listhtlcs(node_factory, bitcoind):
     assert [h['direction'] for h in c1htlcs] == ['out'] * 3
     assert [h['state'] for h in c1htlcs] == ['RCVD_REMOVE_ACK_REVOCATION'] * 3
 
-    # These should be a mirror!
+    # These should be a mirror! (Except indexes)
     c2c1htlcs = l2.rpc.listhtlcs(c12)['htlcs']
     for h in c2c1htlcs:
         assert h['state'] == 'SENT_REMOVE_ACK_REVOCATION'
         assert h['direction'] == 'in'
         h['state'] = 'RCVD_REMOVE_ACK_REVOCATION'
         h['direction'] = 'out'
+        del h['created_index']
+        del h['updated_index']
+    for h in c1htlcs:
+        del h['created_index']
+        del h['updated_index']
     assert c2c1htlcs == c1htlcs
 
     # One channel at a time should result in all htlcs.
@@ -3312,11 +3388,52 @@ def test_listforwards_and_listhtlcs(node_factory, bitcoind):
     for h in allhtlcs:
         assert h in parthtlcs
 
-    # Now, close and forget.
-    l2.rpc.close(c24)
-    l2.rpc.close(c12)
+    # Ordering and limiting should work (with or without channel specified)
+    assert l2.rpc.listhtlcs(index='created', start=1)['htlcs'] == allhtlcs
+    assert l2.rpc.listhtlcs(index='created', start=1, limit=1)['htlcs'] == [allhtlcs[0]]
+    assert l2.rpc.listhtlcs(index='created', start=3, limit=100)['htlcs'] == allhtlcs[2:]
+    assert l2.rpc.listhtlcs(index='created', start=3, limit=1)['htlcs'] == [allhtlcs[2]]
+    assert l2.rpc.listhtlcs(id=c12, index='created', start=1)['htlcs'] == [allhtlcs[0], allhtlcs[2], allhtlcs[4]]
+    assert l2.rpc.listhtlcs(id=c12, index='created', start=2)['htlcs'] == [allhtlcs[2], allhtlcs[4]]
+    assert l2.rpc.listhtlcs(id=c12, index='created', start=2, limit=1)['htlcs'] == [allhtlcs[2]]
+    assert l2.rpc.listhtlcs(id=c12, index='created', start=3, limit=2)['htlcs'] == [allhtlcs[2], allhtlcs[4]]
 
-    bitcoind.generate_block(100, wait_for_mempool=3)
+    # Turns out this order is the same, but updated indexes are larger.
+    # Usually order is the same, but can be different!
+    updatedhtlcs = sorted(allhtlcs, key=lambda htlc: htlc['updated_index'])
+    assert l2.rpc.listhtlcs(index='updated')['htlcs'] == updatedhtlcs
+    assert l2.rpc.listhtlcs(index='updated', start=1, limit=1)['htlcs'] == [updatedhtlcs[0]]
+    assert l2.rpc.listhtlcs(index='updated', start=updatedhtlcs[0]['updated_index'] + 1, limit=100)['htlcs'] == updatedhtlcs[1:]
+    assert l2.rpc.listhtlcs(index='updated', start=updatedhtlcs[1]['updated_index'] + 1, limit=1)['htlcs'] == [updatedhtlcs[2]]
+    c12htlcs = [h for h in updatedhtlcs if h['short_channel_id'] == c12]
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=c12htlcs[0]['updated_index'])['htlcs'] == c12htlcs
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=c12htlcs[0]['updated_index'] + 1)['htlcs'] == [c12htlcs[1], c12htlcs[2]]
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=c12htlcs[2]['updated_index'], limit=1)['htlcs'] == [c12htlcs[2]]
+    assert l2.rpc.listhtlcs(id=c12, index='updated', start=c12htlcs[1]['updated_index'], limit=2)['htlcs'] == [c12htlcs[1], c12htlcs[2]]
+
+    # Now, close and forget (first mine c23 close)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    l2.rpc.close(c24)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    l2.rpc.close(c12)
+    # Not actually deleted yet.
+    assert l2.rpc.wait('htlcs', 'deleted', 0)['deleted'] == 0
+
+    # 99 blocks is not enough for them to be deleted.
+    bitcoind.generate_block(97, wait_for_mempool=1)
+    assert l2.rpc.wait('htlcs', 'deleted', 0)['deleted'] == 0
+
+    # This will forget c23
+    bitcoind.generate_block(1)
+    assert l2.rpc.wait('htlcs', 'deleted', 1)['deleted'] == 1
+
+    # This will forget c24
+    bitcoind.generate_block(1)
+    assert l2.rpc.wait('htlcs', 'deleted', 2)['deleted'] == 2
+
+    # This will forget c12
+    bitcoind.generate_block(1)
+    assert l2.rpc.wait('htlcs', 'deleted', 3)['deleted'] == 5
 
     # Once channels are gone, htlcs are gone.
     for n in (l1, l2, l3, l4):
@@ -3360,19 +3477,19 @@ def test_listforwards_wait(node_factory, executor):
     waitres = waitcreate.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
                        'created': 1,
-                       'details': {'in_channel': scid12,
-                                   'in_htlc_id': 0,
-                                   'in_msat': Millisatoshi(amt1 + 1),
-                                   'out_channel': scid23,
-                                   'status': 'offered'}}
+                       'forwards': {'in_channel': scid12,
+                                    'in_htlc_id': 0,
+                                    'in_msat': Millisatoshi(amt1 + 1),
+                                    'out_channel': scid23,
+                                    'status': 'offered'}}
     waitres = waitupdate.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
                        'updated': 1,
-                       'details': {'in_channel': scid12,
-                                   'in_htlc_id': 0,
-                                   'in_msat': Millisatoshi(amt1 + 1),
-                                   'out_channel': scid23,
-                                   'status': 'settled'}}
+                       'forwards': {'in_channel': scid12,
+                                    'in_htlc_id': 0,
+                                    'in_msat': Millisatoshi(amt1 + 1),
+                                    'out_channel': scid23,
+                                    'status': 'settled'}}
 
     # Now check failure.
     amt2 = 42
@@ -3389,19 +3506,19 @@ def test_listforwards_wait(node_factory, executor):
     waitres = waitcreate.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
                        'created': 2,
-                       'details': {'in_channel': scid12,
-                                   'in_htlc_id': 1,
-                                   'in_msat': Millisatoshi(amt2 + 1),
-                                   'out_channel': scid23,
-                                   'status': 'offered'}}
+                       'forwards': {'in_channel': scid12,
+                                    'in_htlc_id': 1,
+                                    'in_msat': Millisatoshi(amt2 + 1),
+                                    'out_channel': scid23,
+                                    'status': 'offered'}}
     waitres = waitupdate.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
                        'updated': 2,
-                       'details': {'in_channel': scid12,
-                                   'in_htlc_id': 1,
-                                   'in_msat': Millisatoshi(amt2 + 1),
-                                   'out_channel': scid23,
-                                   'status': 'failed'}}
+                       'forwards': {'in_channel': scid12,
+                                    'in_htlc_id': 1,
+                                    'in_msat': Millisatoshi(amt2 + 1),
+                                    'out_channel': scid23,
+                                    'status': 'failed'}}
 
     # Order and pagination.
     assert [(p['created_index'], p['in_msat'], p['status']) for p in l2.rpc.listforwards(index='created')['forwards']] == [(1, Millisatoshi(amt1 + 1), 'settled'), (2, Millisatoshi(amt2 + 1), 'failed')]
@@ -3422,9 +3539,88 @@ def test_listforwards_wait(node_factory, executor):
     waitres = waitfut.result(TIMEOUT)
     assert waitres == {'subsystem': 'forwards',
                        'deleted': 1,
-                       'details': {'in_channel': scid12,
-                                   'in_htlc_id': 1,
-                                   'status': 'failed'}}
+                       'forwards': {'in_channel': scid12,
+                                    'in_htlc_id': 1,
+                                    'status': 'failed'}}
+
+
+def test_listhtlcs_wait(node_factory, bitcoind, executor):
+    l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True)
+
+    scid12 = first_scid(l1, l2)
+    scid23 = first_scid(l2, l3)
+    waitres = l1.rpc.wait(subsystem='htlcs', indexname='created', nextvalue=0)
+    assert waitres == {'subsystem': 'htlcs',
+                       'created': 0}
+
+    # Now ask for 1.
+    waitcreate = executor.submit(l2.rpc.wait, subsystem='htlcs', indexname='created', nextvalue=1)
+    waitupdate = executor.submit(l2.rpc.wait, subsystem='htlcs', indexname='updated', nextvalue=1)
+    time.sleep(1)
+
+    amt1 = 1000
+    inv1 = l3.rpc.invoice(amt1, 'inv1', 'desc')
+    l1.rpc.pay(inv1['bolt11'])
+
+    waitres = waitcreate.result(TIMEOUT)
+    assert waitres == {'subsystem': 'htlcs',
+                       'created': 1,
+                       'htlcs': {'short_channel_id': scid12,
+                                 'cltv_expiry': 120,
+                                 'direction': 'in',
+                                 'htlc_id': 0,
+                                 'payment_hash': inv1['payment_hash'],
+                                 'amount_msat': amt1 + 1,
+                                 'state': 'RCVD_ADD_COMMIT'}}
+    waitres = waitupdate.result(TIMEOUT)
+    assert waitres == {'subsystem': 'htlcs',
+                       'updated': 1,
+                       'htlcs': {'short_channel_id': scid12,
+                                 'cltv_expiry': 120,
+                                 'direction': 'in',
+                                 'htlc_id': 0,
+                                 'payment_hash': inv1['payment_hash'],
+                                 'amount_msat': amt1 + 1,
+                                 'state': 'SENT_ADD_REVOCATION'}}
+
+    # There's a second new one too, for the outgoing, but we missed details
+    assert l2.rpc.wait(subsystem='htlcs', indexname='created', nextvalue=2) == {'created': 2, 'subsystem': 'htlcs'}
+
+    # Now check failure, and wait for OUTGOING.
+    amt2 = 42
+    inv2 = l3.rpc.invoice(amt2, 'inv2', 'invdesc2')
+    l3.rpc.delinvoice('inv2', 'unpaid')
+
+    waitcreate = executor.submit(l2.rpc.wait, subsystem='htlcs', indexname='created', nextvalue=4)
+    time.sleep(1)
+
+    with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
+        l1.rpc.pay(inv2['bolt11'])
+
+    waitres = waitcreate.result(TIMEOUT)
+    assert waitres == {'subsystem': 'htlcs',
+                       'created': 4,
+                       'htlcs': {'short_channel_id': scid23,
+                                 'cltv_expiry': 114,
+                                 'direction': 'out',
+                                 'htlc_id': 1,
+                                 'payment_hash': inv2['payment_hash'],
+                                 'amount_msat': amt2,
+                                 'state': 'SENT_ADD_HTLC'}}
+
+    # Finally, check deletion (only when channel finally forgotten)
+    l1.rpc.close(l2.info['id'])
+
+    waitfut = executor.submit(l2.rpc.wait, subsystem='htlcs', indexname='deleted', nextvalue=1)
+    time.sleep(1)
+
+    bitcoind.generate_block(100, wait_for_mempool=1)
+
+    waitres = waitfut.result(TIMEOUT)
+    # Both will be deleted at once!  We just get told the channel.
+    assert waitres == {'subsystem': 'htlcs',
+                       'deleted': 2,
+                       'htlcs': {'short_channel_id': scid12}}
 
 
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "modifies database, which is assumed sqlite3")
@@ -4181,15 +4377,16 @@ def test_setconfig(node_factory, bitcoind):
         assert lines == ["# Created and update by setconfig, but you can edit this manually when node is stopped.", "min-capacity-sat=400000"]
 
 
-def test_setconfig_access(node_factory, bitcoind, db_provider):
+def test_setconfig_access(node_factory, bitcoind):
     """Test that we correctly fail (not crash) if config file/dir not writable"""
 
     # Disable bookkeeper, with its separate db which gets upset under CI.
     options = {'disable-plugin': 'bookkeeper'}
 
     # sqlite3 gets upset if the directory is non-writable when it tries to commit.
-    if db_provider == 'sqlite3':
-        options['wallet'] = os.path.join(node_factory.directory, 'l1.sqlite3')
+    if os.getenv('TEST_DB_PROVIDER', 'sqlite3') == 'sqlite3':
+        options['wallet'] = 'sqlite3://' + os.path.join(node_factory.directory, 'l1.sqlite3')
+
     l1 = node_factory.get_node(options=options)
 
     netconfigfile = os.path.join(l1.daemon.opts.get("lightning-dir"), TEST_NETWORK, 'config')

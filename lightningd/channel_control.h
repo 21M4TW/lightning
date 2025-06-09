@@ -13,8 +13,7 @@ struct peer;
 bool peer_start_channeld(struct channel *channel,
 			 struct peer_fd *peer_fd,
 			 const u8 *fwd_msg,
-			 bool reconnected,
-			 bool reestablish_only);
+			 bool reconnected);
 
 /* Send message to channeld (if connected) to tell it about depth
  * c.f. dualopen_tell_depth! */
@@ -23,8 +22,7 @@ void channeld_tell_depth(struct channel *channel,
 			 u32 depth);
 
 /* Notify channels of new blocks. */
-void channel_notify_new_block(struct lightningd *ld,
-			      u32 block_height);
+void channel_notify_new_block(struct lightningd *ld);
 
 /* Cancel the channel after `fundchannel_complete` succeeds
  * but before funding broadcasts. */
